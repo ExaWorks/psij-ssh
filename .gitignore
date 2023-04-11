@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+.idea/
+.mypy_cache/
+.pytest_cache/
+
+docs/.build/
+docs/.generated/
+
+src/test.py
+
+psi_j_python.egg-info/
+
+venv*
+.venv*
+build/

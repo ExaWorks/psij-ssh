@@ -1,0 +1,19 @@
+[mypy]
+mypy_path = $MYPY_CONFIG_FILE_DIR/src/stubs
+exclude = tests/plugins[12]/.*
+
+[mypy-distutils.versionpredicate]
+ignore_missing_imports = True
+
+[mypy-psutil.*]
+ignore_missing_imports = True
+
+[mypy-radical.*]
+ignore_missing_imports = True
+
+[mypy-flux.*]
+ignore_missing_imports = True
+
+[mypy-pystache.*]
+ignore_missing_imports = True
+
