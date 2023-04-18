@@ -23,97 +23,76 @@ class SSHJobExecutor(JobExecutor):
     a shell environment.
     """
 
-    _state_map = {'NEW': JobState.NEW,
-                  'QUEUED': JobState.QUEUED,
-                  'ACTIVE': JobState.ACTIVE,
-                  'COMPLETED': JobState.COMPLETED,
-                  'FAILED': JobState.FAILED,
-                  'CANCELED': JobState.CANCELED}
-    _final = [JobState.COMPLETED, JobState.FAILED, JobState.CANCELED]
-
     def __init__(
         self, url: Optional[str] = None, config: Optional[JobExecutorConfig] = None
     ) -> None:
         """
-        Initializes a `SSHJobExecutor`.
+        Initializes a `SSHJobExecutor`.  It will establish an ssh connection to
+        the target host, bootstrap a PSIJ-REST or PSIJ-ZMQ service endpoint
+        there, and then proxy job submission via that service instance.
 
         :param url: address at which to contact the remote service.
-                    Supported schemas: `ssh://`
+                    Supported schemas: `ssh+zmq://` and `ssh+rest://`
         :param config: The `SSHJobExecutor` does not have any
                     configuration options.
         """
         ru_url = ru.Url(url)
-        if ru_url.schema not in ['ssh']:
-            raise ValueError('expected `ssh://` as url schema')
+        if 'ssh+' not in ru_url.schema:
+            raise ValueError('expected `ssh+XXX://` type url schema')
+
+        schema = ru_url.schema.split('+', 1)[1]
+        if schema not in ['zmq', 'rest']:
+            raise ValueError('expected `ssh+zmq://` or `ssh+rest://` url')
 
         if not config:
             config = JobExecutorConfig()
 
-        if ru_url.path and ru_url.path != '/':
-            name = ru_url.path.strip('/')
-            ru_url.path = None
-        else:
-            name = 'local'
         super().__init__(url=str(ru_url), config=config)
+        self._executor = self._connect_service(ru_url, schema)
 
-        self._jobs: Dict[str, Job] = dict()
-        self._idmap: Dict[str, str] = dict()
-        self._serialize = Export()
+    def _connect_service(self, url: ru.Url, schema: str) -> JobExecutor:
 
-        # we can only update the idmap when the `submit` request returns, but
-        # an state notification may happen before that.  We use a lock to ensure
-        # that state updates are delayed until after `submit` completed.
-        self._lock = threading.Lock()
+        from fabric import Connection
 
-        # connect to service and register this client instance
-        self._client = ru.zmq.Client(url=str(ru_url).rstrip('/'))
-        self._cid, sub_url = self._client.request('register', name=name)
+        # FIXME: remove
+        ve = '/home/merzky/projects/exaworks/psij-ssh/ve3/'
 
-        # subscribe for state update information (trigger `self._state_cb`)
-        self._sub = ru.zmq.Subscriber(channel='state', url=sub_url,
-                                      cb=self._state_cb, topic=self._cid)
+        env_script = ru.which('radical-utils-env.sh')
+        ve_script = ru.which('radical-utils-create-ve')
 
-    def __del__(self) -> None:
-        """Stop subscriber thread upon destruction."""
-        self._sub.stop()
+        # FIXME: host, port, auth
+        Connection(url.host).run('mkdir -p /tmp/ssh_test/')
 
-    def _state_cb(self, topic: str, msg: Dict[str, Any]) -> None:
-        """Callback triggered on job state update messages.
+        # this is not stable on concurrent client ops
+        try:
+            Connection('localhost').put(env_script, remote='/tmp/ssh_test/')
+        except Exception:
+            pass
 
-        Update the status of the psij.Job.
-        """
-        assert topic == self._cid, str([topic, self._cid, msg])
+        try:
+            Connection('localhost').put(ve_script, remote='/tmp/ssh_test/')
+        except Exception:
+            pass
 
-        with self._lock:
-            jobid = self._idmap.get(msg['jobid'])
-            if not jobid:
-                # FIXME: use logger
-                print('job %s unknown: %s' % (jobid, self._idmap.keys()))
-                return
+        # cmd = '%s -P "PATH=$PATH:/tmp/ssh_test" -m psij-zmq -v 3.8' % ve_script
+        cmd = '%s -P "PATH=$PATH:/tmp/ssh_test" -v 3.8 -t %s' % (ve_script, ve)
+        result = Connection('localhost').run(cmd, hide=True)
+        # print(result)
 
-        job = self._jobs.get(jobid)
-        assert job
-
-        state = self._state_map[msg['state']]
-        status = JobStatus(state, time=msg['time'], message=msg['message'],
-                           exit_code=msg['exit_code'], metadata=msg['metadata'])
-        self._set_job_status(job, status)
-
-        if state in self._final:
-            del self._jobs[jobid]
+        cmd = '. %s/ru_ve_activate.sh; radical-utils-service -n test -c "psij_zmq_service.py"' % ve
+        result = Connection('localhost').run(cmd, timeout=5.1, hide=True)
+        addr = result.stdout.split(':', 1)[1].strip()
+        print(addr)
+        ex = JobExecutor.get_instance(name='zmq', url=addr)
+        return ex
 
     def submit(self, job: Job) -> None:
         """See :func:`~psij.job_executor.JobExecutor.submit`."""
-        job.executor = self
-        with self._lock:
-            self._jobs[job.id] = job
-            job._native_id = str(self._client.request('submit', cid=self._cid,
-                                                      spec=self._serialize.to_dict(job.spec)))
-            self._idmap[job._native_id] = job.id
+        return self._executor.submit(job)
 
     def cancel(self, job: Job) -> None:
         """See :func:`~psij.job_executor.JobExecutor.cancel`."""
-        self._client.request('cancel', cid=self._cid, jobid=job._native_id)
+        return self._executor.cancel(job)
 
     def list(self) -> List[str]:
         """See :func:`~psij.job_executor.JobExecutor.list`.
@@ -124,10 +103,7 @@ class SSHJobExecutor(JobExecutor):
 
         :return: The list of known job ids.
         """
-        ret = list()
-        for val in self._client.request('list', cid=self._cid):
-            ret.append(str(val))
-        return ret
+        return self._executor.list()
 
     def attach(self, job: Job, native_id: str) -> None:
         """
@@ -139,8 +115,4 @@ class SSHJobExecutor(JobExecutor):
         :param native_id: The native ID of the backend job to attached to, as
           obtained through the `:func:list` method.
         """
-        assert job.status.state == JobState.NEW
-        job.executor = self
-        job._native_id = native_id
-        self._idmap[native_id] = job.id
-        self._jobs[job.id] = job
+        return self._executor.attach(job, native_id)
