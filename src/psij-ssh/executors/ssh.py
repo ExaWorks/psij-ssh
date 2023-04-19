@@ -1,5 +1,6 @@
 """This module contains the SSHJobExecutor :class:`~psij.JobExecutor`."""
 
+import os
 import threading
 from typing import Optional, List, Dict, Any
 
@@ -23,12 +24,11 @@ class SSHJobExecutor(JobExecutor):
     a shell environment.
     """
 
-    def __init__(
-        self, url: Optional[str] = None, config: Optional[JobExecutorConfig] = None
-    ) -> None:
+    def __init__(self, url: Optional[str] = None,
+                 config: Optional[JobExecutorConfig] = None) -> None:
         """
         Initializes a `SSHJobExecutor`.  It will establish an ssh connection to
-        the target host, bootstrap a PSIJ-REST or PSIJ-ZMQ service endpoint
+        the target host, bootstrap a PSIJ-ZMQ or PSIJ-REST service endpoint
         there, and then proxy job submission via that service instance.
 
         :param url: address at which to contact the remote service.
@@ -54,36 +54,71 @@ class SSHJobExecutor(JobExecutor):
 
         from fabric import Connection
 
-        # FIXME: remove
-        ve = '/home/merzky/projects/exaworks/psij-ssh/ve3/'
+        ve = '/home/merzky/projects/exaworks/psij-ssh/ve3/'  # FIXME: remove
+        home = Connection(url.host).run('echo $HOME', hide=True).stdout.strip()
+        base = '%s/.psij/' % home
+        host = url.host
 
-        env_script = ru.which('radical-utils-env.sh')
-        ve_script = ru.which('radical-utils-create-ve')
+        env_script_name = 'radical-utils-env.sh'
+        ve_script_name = 'radical-utils-create-ve'
+
+        env_script = ru.which(env_script_name)
+        ve_script = ru.which(ve_script_name)
+
+        assert env_script
+        assert ve_script
 
         # FIXME: host, port, auth
-        Connection(url.host).run('mkdir -p /tmp/ssh_test/')
+        Connection(url.host).run('mkdir -p %s' % base)
 
-        # this is not stable on concurrent client ops
-        try:
-            Connection('localhost').put(env_script, remote='/tmp/ssh_test/')
-        except Exception:
-            pass
+        # stage the required bootstrap scripts to remote
+        # NOTE: this is not stable on concurrent client ops
+        Connection(host).put(env_script, remote=base)
+        Connection(host).put(ve_script, remote=base)
 
-        try:
-            Connection('localhost').put(ve_script, remote='/tmp/ssh_test/')
-        except Exception:
-            pass
+        cmd = 'chmod 0700 %s/%s %s/%s' % (base, ve_script_name,
+                                          base, env_script_name)
+        Connection(url.host).run(cmd, hide=True)
 
-        # cmd = '%s -P "PATH=$PATH:/tmp/ssh_test" -m psij-zmq -v 3.8' % ve_script
-        cmd = '%s -P "PATH=$PATH:/tmp/ssh_test" -v 3.8 -t %s' % (ve_script, ve)
-        result = Connection('localhost').run(cmd, hide=True)
-        # print(result)
+        cmd = '/bin/sh %s/%s -P "PATH=$PATH:%s" -v 3.8' \
+              % (base, ve_script_name, base)
+        cmd += ' -t %s' % ve  # FIXME
+        if schema == 'zmq':
+            cmd += ' -m psij-zmq'
+        elif schema == 'rest':
+            cmd += ' -m psij-rest'
 
-        cmd = '. %s/ru_ve_activate.sh; radical-utils-service -n test -c "psij_zmq_service.py"' % ve
-        result = Connection('localhost').run(cmd, timeout=5.1, hide=True)
-        addr = result.stdout.split(':', 1)[1].strip()
-        print(addr)
-        ex = JobExecutor.get_instance(name='zmq', url=addr)
+        result = Connection(host).run(cmd, hide=True)
+
+        activate = None
+        for line in result.stdout.split('\n'):
+            if line.startswith('VE_ACTIVATE: '):
+                activate = line.split(':', 1)[1].strip()
+                break
+
+        activate = '%s/bin/activate' % ve  # FIXME
+
+        cmd = '. %s' % activate
+        cmd += '; radical-utils-service -n psij_%s -b %s' % (schema, base)
+        if schema == 'zmq':
+            cmd += ' -c psij_zmq_service.py'
+        elif schema == 'rest':
+            cmd += ' -c "psij_rest_service.py 8080"'
+
+        result = Connection(host).run(cmd, timeout=5.1, hide=True)
+
+        addr = None
+        if schema == 'zmq':
+            line_1 = result.stdout.split('\n', 1)[0]
+            addr = line_1.split(':', 1)[1].strip()
+        elif schema == 'rest':
+            for line in result.stdout.split('\n'):
+                if line.startswith('INFO:     Uvicorn running on'):
+                    addr = line.split()[4]
+
+        assert addr
+
+        ex = JobExecutor.get_instance(name=schema, url=addr)
         return ex
 
     def submit(self, job: Job) -> None:
