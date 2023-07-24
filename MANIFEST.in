@@ -1,0 +1,8 @@
+
+include *.py *.md *.sh *.txt
+include LICENSE MANIFEST.in RELEASE VERSION
+
+recursive-include bin      *.py
+recursive-include src      *.sh *.json VERSION
+recursive-include examples *.py *.json
+
